@@ -21,30 +21,44 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    # 预训练目标是 next-token prediction：输入 X，预测右移一位后的 Y。
+    # loss_mask 用来忽略 padding token，避免模型把补齐位置也当作学习目标。
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+        # X/Y/loss_mask 都来自 PretrainDataset：
+        # X = input_ids[:-1]，Y = input_ids[1:]，所以每个位置都在预测下一个 token。
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
+        # 每个 step 根据余弦曲线更新学习率，训练前期较大，后期逐步衰减。
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # autocast_ctx 在 GPU 上启用 bf16/fp16 混合精度，减少显存占用并提升吞吐。
         with autocast_ctx:
+            # res.logits: [batch, seq_len, vocab_size]，每个位置输出对全词表的分类分数。
             res = model(X)
+            # CrossEntropyLoss 需要二维 logits，因此先把 [B, T, V] 展平成 [B*T, V]；
+            # 计算完再 reshape 回 [B, T]，方便按 token 位置套 loss_mask。
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
 
+            # 只统计非 padding 位置的语言模型损失。MoE 模型还会额外带一个负载均衡 aux_loss。
             logits_loss = (loss * loss_mask).sum() / loss_mask.sum()
             loss = logits_loss + res.aux_loss
+            # 梯度累积时，每个 micro-batch 的 loss 先除以累积步数，
+            # 这样累积后的梯度尺度等价于一个更大的 batch。
             loss = loss / args.accumulation_steps
 
+        # GradScaler 只在 fp16 时真正启用，用来降低梯度 underflow 风险；bf16 下基本是直通。
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
+            # 只有累积到指定步数才执行一次 optimizer.step。裁剪前先 unscale，确保 grad_clip 用真实梯度。
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -69,10 +83,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            # DDP 会把真实模型包在 model.module 里，保存时要取内部模型的 state_dict。
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
+            # 普通权重保存为 half + CPU，文件更小；resume checkpoint 另存优化器和 scaler 状态。
             state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
             torch.save(state_dict, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
@@ -132,7 +148,9 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
+    # init_model 会创建 MiniMindForCausalLM，并加载 ../model 下的 tokenizer。
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    # PretrainDataset 会把原始 text 编码为 token ids，并构造 X/Y next-token 训练样本。
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
@@ -156,6 +174,7 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
+            # resume 时跳过已经训练过的 batch，避免同一个 epoch 内重复消费数据。
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')

@@ -6,6 +6,7 @@ from transformers import PretrainedConfig
 
 
 class MiniMindConfig(PretrainedConfig):
+    # 继承 HuggingFace PretrainedConfig，方便 save_pretrained/from_pretrained 和 generation API 识别模型类型。
     model_type = "minimind"
 
     def __init__(
@@ -44,6 +45,7 @@ class MiniMindConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.hidden_act = hidden_act
+        # hidden_size 是每个 token 的向量维度；intermediate_size 是 FFN 中间层维度。
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings
@@ -94,6 +96,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class RMSNorm(torch.nn.Module):
+    # RMSNorm 只按均方根归一化，不减均值；相比 LayerNorm 更轻量，是 LLaMA/GPT 类模型常用选择。
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -108,6 +111,7 @@ class RMSNorm(torch.nn.Module):
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
                          rope_scaling: Optional[dict] = None):
+    # RoPE 把位置信息编码成每个 head_dim 上的 cos/sin 表，后续直接切片使用，避免每次 forward 重算。
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
@@ -129,6 +133,7 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # 对 q/k 做旋转位置编码。注意 RoPE 作用在注意力的 query/key 上，不作用在 value 上。
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
@@ -139,6 +144,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    # GQA/MQA 中 key/value heads 少于 query heads，需要把 KV 复制到和 Q heads 数量一致。
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -148,12 +154,14 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
+    # 自注意力层：支持 GQA、RoPE、KV cache 和 PyTorch 2.x 的 scaled_dot_product_attention。
     def __init__(self, args: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
         assert args.num_attention_heads % self.num_key_value_heads == 0
         self.n_local_heads = args.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
+        # n_rep 表示每个 KV head 要服务多少个 Q head；num_key_value_heads < num_attention_heads 时就是 GQA。
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
@@ -173,15 +181,17 @@ class Attention(nn.Module):
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
         bsz, seq_len, _ = x.shape
+        # 线性投影得到 Q/K/V，再 reshape 成多头形式：[B, T, heads, head_dim]。
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
+        # 给 Q/K 注入位置信息；自回归解码时 cos/sin 会按 start_pos 切片。
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
-        # kv_cache实现
+        # KV cache 用于推理生成：历史 token 的 K/V 不再重复计算，只和当前 token 拼接。
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -193,9 +203,11 @@ class Attention(nn.Module):
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
 
+        # 训练时通常走 Flash Attention；带 KV cache 或 padding mask 时走下面的手写 attention 分支。
         if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
+            # 手写 attention：QK^T / sqrt(d)，再加 causal mask，保证当前位置看不到未来 token。
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
 
@@ -214,6 +226,7 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
+    # SwiGLU FFN：down_proj(silu(gate_proj(x)) * up_proj(x))，比普通两层 MLP 表达力更强。
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         if config.intermediate_size is None:
@@ -230,6 +243,7 @@ class FeedForward(nn.Module):
 
 
 class MoEGate(nn.Module):
+    # MoE 门控网络：给每个 token 选择 top-k 个专家，并计算负载均衡辅助损失。
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -250,6 +264,7 @@ class MoEGate(nn.Module):
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
+        # 把 [B, T, H] 展平为 [B*T, H]，对每个 token 独立计算专家路由分数。
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
@@ -257,6 +272,7 @@ class MoEGate(nn.Module):
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
 
+        # topk_idx 是每个 token 选中的专家编号，topk_weight 是对应专家输出的加权系数。
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
         if self.top_k > 1 and self.norm_topk_prob:
@@ -264,6 +280,7 @@ class MoEGate(nn.Module):
             topk_weight = topk_weight / denominator
 
         if self.training and self.alpha > 0.0:
+            # aux_loss 鼓励 token 不要长期挤到少数专家上，缓解专家负载不均衡。
             scores_for_aux = scores
             aux_topk = self.top_k
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
@@ -286,6 +303,7 @@ class MoEGate(nn.Module):
 
 
 class MOEFeedForward(nn.Module):
+    # 用多个 FeedForward 专家替换普通 FFN；每个 token 只激活 top-k 个 routed experts。
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -301,6 +319,7 @@ class MOEFeedForward(nn.Module):
             ])
 
     def forward(self, x):
+        # x: [B, T, H]。先路由到专家，再把专家输出按 gate 权重加权求和。
         identity = x
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
@@ -309,6 +328,7 @@ class MOEFeedForward(nn.Module):
         x = x.view(-1, x.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
+            # 训练分支保留梯度：把每个 token 按 top-k 复制，再分发给对应专家。
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             y = torch.empty_like(x, dtype=x.dtype)
             for i, expert in enumerate(self.experts):
@@ -318,6 +338,7 @@ class MOEFeedForward(nn.Module):
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         else:
+            # 推理分支不需要梯度，按专家聚合 token 后批量计算，减少重复索引开销。
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
@@ -350,6 +371,7 @@ class MOEFeedForward(nn.Module):
 
 
 class MiniMindBlock(nn.Module):
+    # 一个 decoder block：Pre-Norm Self-Attention + 残差，再 Pre-Norm FFN/MoE + 残差。
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
@@ -363,6 +385,7 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # Pre-Norm 结构先归一化再进子层，训练深层 Transformer 时通常更稳定。
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
@@ -374,15 +397,18 @@ class MiniMindBlock(nn.Module):
 
 
 class MiniMindModel(nn.Module):
+    # 不含 lm_head 的主体网络：token embedding -> 多层 decoder block -> final RMSNorm。
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        # input_ids 先通过 embedding 查表，变成 [B, T, hidden_size] 的连续向量。
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # RoPE cos/sin 作为 buffer 保存，不参与训练，也不写入 checkpoint。
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, rope_base=config.rope_theta,
                                                     rope_scaling=config.rope_scaling)
@@ -396,18 +422,21 @@ class MiniMindModel(nn.Module):
                 use_cache: bool = False,
                 **kwargs):
         batch_size, seq_length = input_ids.shape
+        # transformers 新版 cache 对象可能带 layers 属性；这里转回本项目使用的 list[tuple(K,V)] 格式。
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
+        # 如果已有 KV cache，当前位置从历史长度 start_pos 开始切 RoPE。
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
         presents = []
+        # 逐层通过 decoder block；present 保存每层新的 KV cache，供 generate 下一步复用。
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
             hidden_states, present = layer(
                 hidden_states,
@@ -420,18 +449,22 @@ class MiniMindModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
+        # 非 MoE 时 aux_loss 为 0；MoE 时把各层门控负载均衡损失加起来交给训练脚本。
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    # HuggingFace 风格的 CausalLM 包装层，提供 logits 输出和 generate 所需接口。
     config_class = MiniMindConfig
 
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
+        # lm_head 把 hidden state 投影回 vocab_size，得到每个位置对下一个 token 的分类 logits。
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 权重共享：输入 embedding 和输出 lm_head 使用同一张词表矩阵，减少参数并常见于 decoder-only LM。
         self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(self,
@@ -448,6 +481,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
+        # 推理时如果只关心最后几个 token 的 logits，可以用 logits_to_keep 减少输出张量大小。
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
