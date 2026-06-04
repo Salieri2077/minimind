@@ -285,12 +285,12 @@ class MoEGate(nn.Module):
             aux_topk = self.top_k
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
-                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1) # gate模型训练得到的对某种expert的打分
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-                    seq_len * aux_topk / self.n_routed_experts)
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+                    seq_len * aux_topk / self.n_routed_experts)# 统计实际每个token被分配到每个专家的次数，除以平均分配时每个专家应该得到的token数量，得到负载均衡程度的指标；如果某个专家得到的token数量远多于平均水平，那么这个ce值就会很大，反之则很小
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha#它实际也经常被选中 + gate 给它的平均概率很高；则loss大
             else:
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
                 ce = mask_ce.float().mean(0)
@@ -372,6 +372,7 @@ class MOEFeedForward(nn.Module):
 
 class MiniMindBlock(nn.Module):
     # 一个 decoder block：Pre-Norm Self-Attention + 残差，再 Pre-Norm FFN/MoE + 残差。
+    # 单个 Transformer decoder block
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
