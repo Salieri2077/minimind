@@ -10,8 +10,9 @@ import math
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from model.model_minimind import MiniMindForCausalLM
 
 def get_model_params(model, config):
@@ -66,8 +67,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
     if model is not None:
-        from torch.nn.parallel import DistributedDataParallel
-        state_dict = model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict()
+        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+        raw_model = getattr(raw_model, '_orig_mod', raw_model)
+        state_dict = raw_model.state_dict()
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
         ckp_tmp = ckp_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
@@ -91,10 +93,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         for key, value in kwargs.items():
             if value is not None:
                 if hasattr(value, 'state_dict'):
-                    if isinstance(value, DistributedDataParallel):
-                        resume_data[key] = value.module.state_dict()
-                    else:
-                        resume_data[key] = value.state_dict()
+                    raw_value = value.module if isinstance(value, DistributedDataParallel) else value
+                    raw_value = getattr(raw_value, '_orig_mod', raw_value)
+                    resume_data[key] = raw_value.state_dict()
                 else:
                     resume_data[key] = value
 
@@ -154,3 +155,23 @@ class SkipBatchSampler(Sampler):
     def __len__(self):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
+
+
+class LMForRewardModel:
+    def __init__(self, model_path, device="cuda", dtype=torch.float16):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
+        self.model = self.model.to(device).eval()
+        self.device = device
+
+    @torch.no_grad()
+    def get_score(self, messages, response):
+        history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
+        last_query = messages[-1]['content'] if messages else ""
+        message_context = f"{history_text}\n以上是对话历史。我的新问题是：\n{last_query}" if history_text else last_query
+        eval_messages = [
+            {"role": "user", "content": message_context},
+            {"role": "assistant", "content": response}
+        ]
+        score = self.model.get_score(self.tokenizer, eval_messages)
+        return max(min(score, 3.0), -3.0)

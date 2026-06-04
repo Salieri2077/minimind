@@ -1,4 +1,9 @@
-model/__pycache__
+__pycache__/
+*.pyc
+.DS_Store
 out
 website/
 docs-minimind/
+# Local training datasets
+dataset/*.jsonl
+model_learn_tokenizer/*.jsonl
