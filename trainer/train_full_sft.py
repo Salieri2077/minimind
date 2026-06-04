@@ -21,38 +21,72 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    # reduction='none' 表示先保留每个 token 各自的 loss，后面再用 loss_mask
+    # 只挑出 assistant 回复部分参与最终 loss。
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
+
+    # loader 每次返回一个 batch：
+    # X: 模型输入 token ids，形状 [batch_size, seq_len]
+    # Y: 训练标签，也就是 X 每个位置对应的“下一个 token”，形状 [batch_size, seq_len]
+    # loss_mask: 哪些位置需要算 loss；SFT 中通常只有 assistant 回复部分为 1。
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
+
+        # 每个 step 动态调整学习率；get_lr 内部是带 warmup 下限的余弦衰减。
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # autocast_ctx 在 GPU 上启用 fp16/bfloat16 混合精度，降低显存占用并加速计算。
         with autocast_ctx:
+            # MiniMindForCausalLM.forward：
+            # 输入 X 后输出 res.logits，形状 [batch_size, seq_len, vocab_size]。
+            # logits[i, t] 表示第 i 条样本第 t 个位置预测“下一个 token”的词表分数。
             res = model(X)
+
+            # CrossEntropyLoss 需要输入形状为 [N, vocab_size]，标签为 [N]，
+            # 所以这里把 batch 和 seq_len 两个维度展平。
+            # 计算完成后再 view 回 [batch_size, seq_len]，得到每个 token 位置的 loss。
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
 
+            # SFT 不希望模型学习预测 system/user 文本，只希望它学习 assistant 回复。
+            # loss_mask 中 assistant 回复位置为 1，其它位置为 0；
+            # 乘上 loss_mask 后，只有 assistant 部分的 token loss 会被保留。
             logits_loss = (loss * loss_mask).sum() / loss_mask.sum()
+
+            # MoE 模型会额外产生 aux_loss，用于专家负载均衡；非 MoE 时通常为 0。
             loss = logits_loss + res.aux_loss
+
+            # 梯度累积：把 loss 除以 accumulation_steps，保证累积多步后的梯度尺度正确。
             loss = loss / args.accumulation_steps
 
+        # 使用 GradScaler 支持 fp16 混合精度训练；bfloat16 时 scaler 通常不会真正启用。
         scaler.scale(loss).backward()
 
+        # 每 accumulation_steps 个 step 才真正更新一次参数。
+        # 中间 step 只做 backward，把梯度累积在参数上。
         if (step + 1) % args.accumulation_steps == 0:
+            # 裁剪梯度前先 unscale，否则 fp16 的缩放梯度会影响裁剪阈值判断。
             scaler.unscale_(optimizer)
+            # 防止梯度爆炸，提升训练稳定性。
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
+            # optimizer.step() 的混合精度版本：如果梯度正常则更新参数。
             scaler.step(optimizer)
+            # 更新 scaler 的缩放系数。
             scaler.update()
 
+            # 清空梯度，set_to_none=True 通常更省显存。
             optimizer.zero_grad(set_to_none=True)
 
+        # 定期打印训练日志。这里 current_loss 乘回 accumulation_steps，
+        # 是为了展示未被梯度累积缩放前的真实 loss 数值。
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -65,14 +99,18 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
+        # 定期保存权重和可续训检查点。
+        # .pth 保存模型权重；lm_checkpoint 额外保存 optimizer/scaler/epoch/step 等训练状态。
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            # DDP 包装后真实模型在 model.module 里；单卡训练则直接用 model。
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
+            # 保存为 half 精度，减少 checkpoint 文件大小。
             state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
             torch.save(state_dict, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
@@ -80,7 +118,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.train()
             del state_dict
 
+        # 主动释放本 step 中的大张量引用，降低长时间训练时的显存压力。
         del X, Y, loss_mask, res, loss
+
 
 
 if __name__ == "__main__":
