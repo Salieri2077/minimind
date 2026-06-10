@@ -7,3 +7,11 @@ docs-minimind/
 # Local training datasets
 dataset/*.jsonl
 model_learn_tokenizer/*.jsonl
+
+# Local training artifacts
+checkpoints/
+checkpoints_deleted/
+out_deleted/
+trainer/swanlog/
+trainer/swanlog_deleted/
+*.pth
