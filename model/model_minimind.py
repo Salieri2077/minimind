@@ -1,4 +1,5 @@
 import math, torch, torch.nn.functional as F
+from typing import List, Optional, Tuple, Union
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
@@ -98,7 +99,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     # 自注意力层：支持 GQA、RoPE、KV cache 和 PyTorch 2.x 的 scaled_dot_product_attention。
-    def __init__(self, args: MiniMindConfig):
+    def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
         self.n_local_heads = config.num_attention_heads
@@ -157,7 +158,7 @@ class Attention(nn.Module):
 
 class FeedForward(nn.Module):
     # SwiGLU FFN：down_proj(silu(gate_proj(x)) * up_proj(x))，比普通两层 MLP 表达力更强。
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
@@ -166,7 +167,7 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class MoEGate(nn.Module):
@@ -239,32 +240,27 @@ class MOEFeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        # x: [B, T, H]。先路由到专家，再把专家输出按 gate 权重加权求和。
-        identity = x
-        orig_shape = x.shape
-        bsz, seq_len, _ = x.shape
-        # 使用门控机制选择专家
-        topk_idx, topk_weight, aux_loss = self.gate(x)
-        x = x.view(-1, x.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
-        if self.training:
-            # 训练分支保留梯度：把每个 token 按 top-k 复制，再分发给对应专家。
-            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
-            y = torch.empty_like(x, dtype=x.dtype)
-            for i, expert in enumerate(self.experts):
-                expert_out = expert(x[flat_topk_idx == i])
-                if expert_out.shape[0] > 0: y[flat_topk_idx == i] = expert_out.to(y.dtype)
-                else: y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
-            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.view(*orig_shape)
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)
+        scores = F.softmax(self.gate(x_flat), dim=-1)
+        topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
+        if self.config.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        y = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_idx == i)
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                weight = topk_weight[mask].view(-1, 1)
+                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
-            # 推理分支不需要梯度，按专家聚合 token 后批量计算，减少重复索引开销。
-            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
-        if self.config.n_shared_experts > 0:
-            for expert in self.shared_experts:
-                y = y + expert(identity)
-        self.aux_loss = aux_loss
-        return y
+            self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.view(batch_size, seq_len, hidden_dim)
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
@@ -380,13 +376,14 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
-                **args):
+                labels: Optional[torch.Tensor] = None,
+                **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            **args
+            **kwargs
         )
         # 推理时如果只关心最后几个 token 的 logits，可以用 logits_to_keep 减少输出张量大小。
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

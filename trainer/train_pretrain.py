@@ -21,45 +21,36 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 warnings.filterwarnings('ignore')
 
 
+def safe_wandb_log(wandb, data):
+    if not wandb:
+        return None
+    try:
+        wandb.log(data)
+        return wandb
+    except Exception as exc:
+        Logger(f'wandb/swanlab log failed, disable logging and continue training: {exc}')
+        return None
+
+
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    # 预训练目标是 next-token prediction：输入 X，预测右移一位后的 Y。
-    # loss_mask 用来忽略 padding token，避免模型把补齐位置也当作学习目标。
-    loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        # X/Y/loss_mask 都来自 PretrainDataset：
-        # X = input_ids[:-1]，Y = input_ids[1:]，所以每个位置都在预测下一个 token。
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
-        # 每个 step 根据余弦曲线更新学习率，训练前期较大，后期逐步衰减。
+    last_step = start_step
+    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+        last_step = step
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        # autocast_ctx 在 GPU 上启用 bf16/fp16 混合精度，减少显存占用并提升吞吐。
         with autocast_ctx:
-            # res.logits: [batch, seq_len, vocab_size]，每个位置输出对全词表的分类分数。
-            res = model(X)
-            # CrossEntropyLoss 需要二维 logits，因此先把 [B, T, V] 展平成 [B*T, V]；
-            # 计算完再 reshape 回 [B, T]，方便按 token 位置套 loss_mask。
-            loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
-                Y.view(-1)
-            ).view(Y.size())
-
-            # 只统计非 padding 位置的语言模型损失。MoE 模型还会额外带一个负载均衡 aux_loss。
-            logits_loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss = logits_loss + res.aux_loss
-            # 梯度累积时，每个 micro-batch 的 loss 先除以累积步数，
-            # 这样累积后的梯度尺度等价于一个更大的 batch。
+            res = model(input_ids, labels=labels)
+            loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
-        # GradScaler 只在 fp16 时真正启用，用来降低梯度 underflow 风险；bf16 下基本是直通。
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
-            # 只有累积到指定步数才执行一次 optimizer.step。裁剪前先 unscale，确保 grad_clip 用真实梯度。
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -76,20 +67,16 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            wandb = safe_wandb_log(wandb, {"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            # DDP 会把真实模型包在 model.module 里，保存时要取内部模型的 state_dict。
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-            # 普通权重保存为 half + CPU，文件更小；resume checkpoint 另存优化器和 scaler 状态。
-            state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            state_dict = raw_model.state_dict()
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
@@ -126,6 +113,8 @@ if __name__ == "__main__":
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
+    parser.add_argument("--wandb_mode", type=str, default="cloud", choices=["cloud", "local", "offline", "disabled"], help="swanlab记录模式")
+    parser.add_argument("--wandb_logdir", type=str, default=None, help="swanlab本地日志目录")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
@@ -152,7 +141,7 @@ if __name__ == "__main__":
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume, mode=args.wandb_mode, logdir=args.wandb_logdir)
     
     # ========== 5. 定义模型、数据、优化器 ==========
     # init_model 会创建 MiniMindForCausalLM，并加载 ../model 下的 tokenizer。
@@ -182,10 +171,11 @@ if __name__ == "__main__":
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
-            # resume 时跳过已经训练过的 batch，避免同一个 epoch 内重复消费数据。
-            batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
